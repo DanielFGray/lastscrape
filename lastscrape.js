@@ -12,7 +12,7 @@ commander
 const query = {
   api_key: 'e38cc7822bd7476fe4083e36ee69748e',
   format: 'json',
-  limit: 50,
+  limit: 200,
 }
 
 const lastfm = opts =>
@@ -34,6 +34,13 @@ const genreOf = memoize(([ artist, album ]) =>
     method: 'album.gettoptags',
     artist,
     album,
+  }))
+
+const albumOf = memoize(([ artist, track ]) =>
+  lastfm({
+    method: 'track.getinfo',
+    artist,
+    track,
   }))
 
 const requestAllTracks = opts =>
@@ -60,22 +67,22 @@ const track$ = requestAllTracks({ page: 1 })
   }))
 
   .flatMap(x =>
+    x.album === '[unknown]' || x.album === ''
+    ? albumOf([ x.artist, x.title ])
+        .map(t => merge(x, { album: t.track.album.title }))
+    : Observable.of(x))
+
+  .flatMap(x =>
     genreOf([ x.artist, x.album ])
       .map(t => t.toptags.tag.slice(0, 3).map(e => e.name))
       .map(t => merge(x, { genres: t.join(',') })))
-
-  .flatMap(x =>
-    x.album === '[unknown]' || x.album === ''
-    ? lastfm({ method: 'track.getinfo', artist: x.artist, album: x.album })
-        .map(t => merge(x, { album: t.track.album.title }))
-    : Observable.of(x))
 
 const file = fs.createWriteStream('rx_stream.csv')
 
 const write$ = track$
   .map(x => `${Object.values(x).join('\t')}\n`)
-  .do(x => process.stdout.write(x))
+  // .do(x => process.stdout.write(x))
   .do(x => file.write(x))
 
 // Observable.merge(write$)
-  .subscribe()
+  .subscribe(undefined, console.log)

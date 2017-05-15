@@ -3,11 +3,25 @@ const fs = require('fs')
 const { Observable } = require('rxjs')
 const { get } = require('superagent')
 const commander = require('commander')
-const { memoize, merge } = require('ramda')
+const {
+  memoize,
+  merge,
+  replace,
+} = require('ramda')
+
+const term = require('terminal-kit').terminal
+
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k)
+const stripDots = replace(/\./g, '')
 
 commander
-  .option('-u, --user [string]', 'Last.fm username')
+  .option('-u, --user <string>', 'Last.fm username')
   .parse(process.argv)
+
+if (! has(commander, 'user')) {
+  term.red('must specify last.fm username with -u or --user\n')
+  process.exit(1)
+}
 
 const query = {
   api_key: 'e38cc7822bd7476fe4083e36ee69748e',
@@ -15,13 +29,20 @@ const query = {
   limit: 200,
 }
 
+const progressBar = term.progressBar({
+  width: process.env.COLUMNS,
+  eta: true,
+  percent: true,
+  titleSize: '50%',
+})
+
 const lastfm = opts =>
   Observable.from(get('http://ws.audioscrobbler.com/2.0/')
     .query(merge(query, opts)))
     .map(x => x.body)
 
 const requestUserTracks = ({ page }) => {
-  process.stderr.write(`fetching page ${page}\r`)
+  progressBar.update({ title: `fetching page ${page}` })
   return lastfm({
     method: 'user.getrecenttracks',
     user: commander.user,
@@ -29,60 +50,73 @@ const requestUserTracks = ({ page }) => {
   })
 }
 
-const genreOf = memoize(([ artist, album ]) =>
-  lastfm({
+const genreOf = memoize(([ artist, album ]) => {
+  progressBar.update({ title: `fetching genre for ${artist} - ${album}` })
+  if (! album) {
+    return lastfm({
+      method: 'artist.gettoptags',
+      artist: stripDots(artist),
+    })
+  }
+  return lastfm({
     method: 'album.gettoptags',
-    artist,
-    album,
-  }))
+    artist: stripDots(artist),
+    album: stripDots(album),
+  })
+})
 
-const albumOf = memoize(([ artist, track ]) =>
-  lastfm({
+const albumOf = memoize(([ artist, track ]) => {
+  progressBar.update({ title: `fetching album for ${artist} - ${track}` })
+  return lastfm({
     method: 'track.getinfo',
-    artist,
-    track,
-  }))
+    artist: stripDots(artist),
+    track: stripDots(track),
+  })
+})
+
+const file = fs.createWriteStream('rx_stream.csv')
 
 const requestAllTracks = opts =>
   Observable.defer(() => requestUserTracks(opts)
     .flatMap((x) => {
       const current = Number(x.recenttracks['@attr'].page)
       const total = Number(x.recenttracks['@attr'].totalPages)
+      progressBar.update({ progress: current / total })
       const items$ = Observable.of(x)
       const next$ =
-        1 + current <= total
-        ? requestAllTracks({ page: 1 + current }) :
-        Observable.empty()
+        1 + current < total
+        ? requestAllTracks({ page: 1 + current })
+        : Observable.empty()
       return Observable.concat(items$, next$)
     }))
 
-const track$ = requestAllTracks({ page: 1 })
+requestAllTracks({ page: 1 })
   .map(x => x.recenttracks)
   .flatMap(x => x.track)
-  .map(x => ({
-    date: x.date ? x.date.uts : '',
-    artist: x.artist['#text'],
-    name: x.name,
-    album: x.album['#text'],
+  .filter(x => typeof x.date !== 'undefined')
+  .map(({ date, artist, name, album }) => ({
+    date: date.uts,
+    artist: artist['#text'],
+    title: name,
+    album: album['#text'],
   }))
 
-  .flatMap(x =>
+  .flatMap(x => (
     x.album === '[unknown]' || x.album === ''
     ? albumOf([ x.artist, x.title ])
-        .map(t => merge(x, { album: t.track.album.title }))
-    : Observable.of(x))
+        .map(t => (
+          ! has(t, 'error') && has(t.track, 'album')
+          ? merge(x, { album: t.track.album.title })
+          : x))
+    : Observable.of(x)))
 
   .flatMap(x =>
     genreOf([ x.artist, x.album ])
-      .map(t => t.toptags.tag.slice(0, 3).map(e => e.name))
-      .map(t => merge(x, { genres: t.join(',') })))
+      .map(t =>
+        ! has(t, 'error') && has(t.toptags, 'tag')
+        ? merge(x, { genres: t.toptags.tag.slice(0, 3).map(e => e.name) })
+        : x))
 
-const file = fs.createWriteStream('rx_stream.csv')
-
-const write$ = track$
   .map(x => `${Object.values(x).join('\t')}\n`)
-  // .do(x => process.stdout.write(x))
   .do(x => file.write(x))
-
-// Observable.merge(write$)
-  .subscribe(undefined, console.log)
+  .subscribe()
